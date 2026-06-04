@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include "fsusb.h"
 #include <string.h>
+#include "ch5xx_flash.h"
 
 
 #ifndef ENABLE_PB8_STATUS_LED
@@ -29,7 +30,7 @@
 #endif
 
 #ifndef SK6812_IS_RGBW
-#define SK6812_IS_RGBW 1
+#define SK6812_IS_RGBW 0
 #endif
 
 #ifndef SK6812_BRIGHT
@@ -183,7 +184,95 @@ static inline uint64_t now_ticks(void) {
 
 // CTF code
 static const uint8_t firstFlag[] = "bsdsm{h4v3_y0u_tri3d_str1ng5}";
+#define PIXEL_NUM 8
+struct fields{
+        uint8_t flashing:1;
+        uint8_t red:2;
+        uint8_t green:2;
+        uint8_t blue:2;
+        uint8_t resv:1;
+    };
 
+union Led_State_t {
+    uint8_t data;
+    struct fields field;
+};
+
+union Led_State_t led_state[PIXEL_NUM];
+
+void Hash(uint8_t*data, uint8_t size, uint8_t length, uint8_t*output)
+{
+    uint8_t h = 0;
+    uint8_t digest_len = length;
+    if(size < length)
+    {
+        digest_len = size;
+    }
+    if(size >= 3)
+    {
+        for( uint8_t count = 0; count < digest_len; count++)
+        {
+            h = (data[count] ^ data[count+1] ^ data[count+2]);
+            output[count] = h;
+        }
+    }
+
+}
+
+#define HW_VILLAGE_MARKER 0x01 // 0b0000 0001
+#define TALKS1_MARKER 0x02     // 0b0000 0010
+#define TALKS2_MARKER 0x04     // 0b0000 0100
+#define SOLDER_VILLAGE_MARKER 0x08 // 0b0000 1000
+#define BLUE_TEAM_VILLAGE_MARKER 0x10 // 0b0001 0000
+#define VENDOR_MARKER 0x20 // 0b0010 0000
+#define CTF_MARKER 0x40 // 0b0100 0000
+#define CHECKIN_MARKER 0x80 0b1000 0000
+
+uint8_t HW_VILLAGE_TAG[] = {0xad,0xcc,0x0e,0x42};
+uint8_t TALKS1_TAG[] = {0x7d,0xf2,0x38,0x6e};
+uint8_t TALKS2_TAG[] = {0xfd,0x6d,0x05,0x42};
+uint8_t SOLDER_VILLAGE_TAG[] = {0x03,0xcf,0xf0,0x20};
+uint8_t BLUE_TEAM_TAG[] = {0x2d,0xf4,0x02,0x6e};
+uint8_t VENDOR_TAG[] = {0x73,0x16,0xe2,0x20};
+uint8_t CTF_TAG[] = {0x86,0x2b,0xd1,0xd2};
+uint8_t CHECKIN_TAG[] = {0x4d,0x8a,0x2a,0x6e};
+
+uint8_t* TAGS[] = {HW_VILLAGE_TAG,TALKS1_TAG,TALKS2_TAG,SOLDER_VILLAGE_TAG,BLUE_TEAM_TAG,VENDOR_TAG,CTF_TAG,CHECKIN_TAG};
+
+struct BadgeState_t {
+	uint8_t markersFound;
+	uint8_t foundTagHash;
+	uint8_t padByte;
+	uint8_t checkSum;
+
+};
+
+struct BadgeState_t BadgeState;
+
+void checkTagCtf(uint8_t *uuid, uint8_t uuid_len)
+{
+	bool found = true;
+	if(uuid_len == 4)
+	{
+		for(int i = 0; i < 8; i++)
+		{
+			found = true;
+			for(int j = 0; j < 4; j++)
+			{
+				if(uuid[j]!=TAGS[i][j])
+				{
+					found = false;
+					break;
+				}
+			}
+			if(found)
+			{
+				printf("Found tag %d",i);
+				BadgeState.markersFound |= (1 << i);
+			}
+		}
+	}
+}
 
 // end CTF code
 
@@ -328,7 +417,7 @@ struct RGBW {
 
 struct RGBW pixels[4];
 
-void blink(int n);
+void blink(int n, uint8_t r, uint8_t g, uint8_t b);
 void debug_print(const uint8_t* msgBuf);
 
 
@@ -400,13 +489,70 @@ static void sk6812_set_grbw()
 
 static void sk6812_set_rgb(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
 {
+	//printf("Setting Led %x: %x %x %x\r\n",index, r, g, b);
 	if(index < 4){
 		pixels[index].r = r;
 		pixels[index].g = g;
 		pixels[index].b = b;
 		pixels[index].w = SK6812_W_BRIGHT;
 	}
+}
+
+void showLeds()
+{
 	sk6812_set_grbw();
+	Delay_Ms(33);
+}
+
+void updateLedState(uint8_t*digest){
+    uint8_t red,green,blue;
+	bool foundFlag = true;
+
+    for(uint8_t i=0;i<4;i++)
+    {
+        led_state[i].data = digest[i];
+		//printf("led state: %x %x %x %x\r\n", led_state[i].field.flashing,led_state[i].field.red, led_state[i].field.green, led_state[i].field.blue);
+        if((led_state[i].field.red & 0x3) == 0x1){
+            red = 127;
+        } else if((led_state[i].field.red & 0x3) == 0x2) {
+            red = 255;
+        } else{
+            red = 0;
+        }
+        if((led_state[i].field.green & 0x3) == 0x1){
+            green = 127;
+        } else if(led_state[i].field.green == 0x2) {
+            green = 255;
+        } else{
+            green = 0;
+        }
+        if((led_state[i].field.blue & 0x3) == 0x1){
+            blue = 127;
+        } else if((led_state[i].field.blue & 0x3) == 0x2) {
+            blue = 255;
+        } else{
+            blue = 0;
+        }
+
+		if(led_state[i].field.flashing & 0x1 == 0x1) {
+			//printf("flashing %x\r\n", i);
+			blink(i,red,green,blue);
+		}
+		sk6812_set_rgb(i,red,green,blue);
+
+		if(!(((led_state[i].field.red & 0x3) == 0x1) &&
+			(led_state[i].field.green == 0x1) &&
+			((led_state[i].field.blue & 0x3) == 0x1) &&
+			(led_state[i].field.flashing & 0x1 == 0x1)))
+			{
+				foundFlag = false;
+			}
+		
+    }
+	if(foundFlag)
+	{
+		BadgeState.foundTagHash = true;
+	}
 }
 
 static void audio_init(void)
@@ -495,9 +641,11 @@ static void tag_feedback(uint8_t uid_len, uint16_t atqa, uint8_t sak)
 	if (g > SK6812_BRIGHT) g = SK6812_BRIGHT;
 	if (b > SK6812_BRIGHT) b = SK6812_BRIGHT;
 	
-	sk6812_set_rgb(0,r, g, b);
-	audio_play_tag_cue(gs_picc_uid, uid_len);
-	sk6812_set_rgb(0,0, 0, 0);
+	//sk6812_set_rgb(0,r, g, b);
+	//showLeds();
+	//audio_play_tag_cue(gs_picc_uid, uid_len);
+	//sk6812_set_rgb(0,0, 0, 0);
+	//showLeds();
 }
 
 static inline void nfca_rx_finalize_from_hw(void) {
@@ -609,18 +757,22 @@ static int ntag_get_version(void)
 	ISO14443AAppendCRCA(g_nfca_pcd_send_buf, 1);
 	ISO14443ACalOddParityBit(g_nfca_pcd_send_buf, g_nfca_parity_buf, 3);
 	nfca_pcd_wait_ms(PCD_T2T_OVER_TIME);
-	sk6812_set_rgb(1,0,0,SK6812_BRIGHT);
+	//sk6812_set_rgb(1,0,0,SK6812_BRIGHT);
+	//showLeds();
 
 	if (nfca_pcd_comm(24, NFCA_PCD_REC_MODE_NORMAL, 0) != 0) {
-		sk6812_set_rgb(1,SK6812_BRIGHT, 0, 0);
+		//sk6812_set_rgb(1,SK6812_BRIGHT, 0, 0);
+		//showLeds();
 		return 0;
 	}
 	if (nfca_pcd_wait_comm_end() != NFCA_PCD_CONTROLLER_STATE_DONE) {
-		sk6812_set_rgb(1,SK6812_BRIGHT, 0, 0);
+		//sk6812_set_rgb(1,SK6812_BRIGHT, 0, 0);
+		//showLeds();
 		return 0;
 	}
 	if ((g_nfca_pcd_recv_bits % 9) != 0) {
-		sk6812_set_rgb(1,SK6812_BRIGHT, 0, 0);
+		//sk6812_set_rgb(1,SK6812_BRIGHT, 0, 0);
+		//showLeds();
 		return 0;
 	}
 	
@@ -688,24 +840,28 @@ static void ntag_dump_read_only(int uid_len)
 	}
 	page_starts[page_start_count++] = 131;
 	
-	sk6812_set_rgb(2,SK6812_BRIGHT, 0, 0);
+	//sk6812_set_rgb(2,SK6812_BRIGHT, 0, 0);
+	//showLeds();
 	Delay_Ms(33);
 
 	if (!ntag_get_version()) {
 	 	usb_send_ntag_done_packet(1);
 		return;
 	}
-	sk6812_set_rgb(2,0, SK6812_BRIGHT, 0);
+	//sk6812_set_rgb(2,0, SK6812_BRIGHT, 0);
+	//showLeds();
 	Delay_Ms(33);
 	
 	if (!ntag_is_ntag215()) {
-		sk6812_set_rgb(2,0, 0, SK6812_BRIGHT);
+		//sk6812_set_rgb(2,0, 0, SK6812_BRIGHT);
+		//showLeds();
 		Delay_Ms(33);
 		usb_send_ntag_done_packet(2);
 		return;
 	}
-	sk6812_set_rgb(2, 0, SK6812_BRIGHT, SK6812_BRIGHT);
-	Delay_Ms(33);
+	//sk6812_set_rgb(2, 0, SK6812_BRIGHT, SK6812_BRIGHT);
+	//showLeds();
+	//Delay_Ms(33);
 	
 	usb_send_ntag_version_packet(uid_len);
 
@@ -821,7 +977,14 @@ static const uint8_t byteParityBitsTable[256] = {
 };
 
 __HIGH_CODE
-void blink(int n) {
+void blink(int n, uint8_t r, uint8_t g, uint8_t b) {
+	for(int i = 0; i < 4; i++)
+	{
+		pixels[i].r = 0;
+		pixels[i].g = 0;
+		pixels[i].b = 0;
+		pixels[i].w = 0;
+	}
 	if( n < 4) {
 		for(int i = 0; i<5;i++)
 		{
@@ -829,14 +992,16 @@ void blink(int n) {
 			funDigitalWrite( LED, FUN_LOW ); // Turn on LED
 			#endif
 			#if !SK6812_DISABLE
-			sk6812_set_rgb(n,SK6812_BRIGHT, 0, 0);
+			sk6812_set_rgb(n,r, g, b);
+			showLeds();
 			#endif
 			Delay_Ms(33);
 			#if ENABLE_PB8_STATUS_LED
 			funDigitalWrite( LED, FUN_HIGH ); // Turn off LED
 			#endif
 			#if !SK6812_DISABLE
-			sk6812_set_rgb(0,0, 0, 0);
+			sk6812_set_rgb(n,0, 0, 0);
+			showLeds();
 			#endif
 			Delay_Ms(33);
 		}
@@ -1765,12 +1930,14 @@ void card_interaction(int uid_len, int atqa, int sak) {
 	int iso14443_3_type2 = (sak == 0x00 && gs_picc_uid[0] != 0x00);
 	uint64_t timeout = 0;
 	
-	sk6812_set_rgb(3,SK6812_BRIGHT, SK6812_BRIGHT, 0);
+	//sk6812_set_rgb(3,SK6812_BRIGHT, SK6812_BRIGHT, 0);
+	//showLeds();
 	if (iso14443_3_type2) {
 		ntag_dump_read_only(uid_len);
 		return;
 	}
-	sk6812_set_rgb(3,0, 0, SK6812_BRIGHT);
+	//sk6812_set_rgb(3,0, 0, SK6812_BRIGHT);
+	//showLeds();
 	
 	if(iso14443_3 || iso14443_3_devtest_jcop) {
 		if(PcdReq(CMD_RATS, 0, 0) == PCD_NO_ERROR) {
@@ -1822,6 +1989,9 @@ void main_task_loop() {
 	uint32_t next_scan_time = 0;
 	uint32_t next_heartbeat_time = 0;
     uint8_t saw_card_response = 0;
+	uint8_t DIGEST_LENGTH = 4;
+	uint8_t digest[DIGEST_LENGTH];
+	uint32_t button_state = 0xff;
 	
 	
 	// Check VDD once at start or periodically if needed (best-effort).
@@ -1849,6 +2019,20 @@ void main_task_loop() {
 		if (SysTick->CNTL > next_heartbeat_time) {
 			send_heartbeat_if_free();
 			next_heartbeat_time = SysTick->CNTL + Ticks_from_Ms(333);
+		}
+
+		button_state = funDigitalRead(PA5);
+		if (!button_state) {
+			printf("Badge State:\r\n");
+			printf("  foundTagHash: %x  markersFound: %x\r\n", BadgeState.foundTagHash, BadgeState.markersFound);
+			if(BadgeState.markersFound == 0xFF)
+			{
+				// make all LEDs Blue
+			}
+			if(BadgeState.foundTagHash == true)
+			{
+				// flash all LEDs white
+			}
 		}
 		
 		// 3. Handle NFC Scan (Periodically)
@@ -2026,10 +2210,20 @@ void main_task_loop() {
 								printf("%02x",gs_picc_uid[i]);
 							}
 							printf(" ATQA: %lx SAK: %lx\r\n",atqa,sak);
+							Hash(gs_picc_uid,uuid_len,DIGEST_LENGTH,digest);
+							printf("digest: ");
+							for(int i = 0; i < DIGEST_LENGTH; i++)
+							{
+								printf(" %02x",digest[i]);
+							}
+							printf("\r\n");
+							updateLedState(digest);
+							showLeds();
 
+							checkTagCtf(gs_picc_uid, uuid_len);
 
-							
-							blink(3);
+							audio_play_tag_cue(gs_picc_uid, uuid_len);
+							//blink(3);
 							// Card is fully selected, enter interaction mode
 							// This function IS allowed to block because we are in a session
 							card_interaction(uuid_len, atqa, sak);
@@ -2054,14 +2248,21 @@ void main_task_loop() {
 	}
 }
 
+#define SECTOR_SIZE 4096
+
 int main() {
 	SystemInit();
 	
 	funGpioInitAll(); // no-op on ch5xx
 	GPIOSetup();
+
+	funPinMode(PA4, GPIO_CFGLR_OUT_2Mhz_PP);
+	funDigitalWrite(PA4, FUN_HIGH);
 	audio_play_boot_debug_beep();
 	usb_rx_reset_assembly();
 	USBFSSetup();
+
+	funPinMode(PA5, GPIO_CFGLR_IN_PU);
 
 	for(int i = 0; i < 4; i++)
 	{
@@ -2073,7 +2274,10 @@ int main() {
 	
 	#if !SK6812_DISABLE
 	sk6812_set_rgb(0,SK6812_BRIGHT, 0, 0);
+	showLeds();
 	#endif
+
+	
 	
 	uint8_t message[30];
 
@@ -2098,17 +2302,65 @@ int main() {
 	secondFlag[15] = 'w';
 	secondFlag[16] = '}';
 
-	sprintf(message,"%s",secondFlag);
+	//sprintf(message,"%s",secondFlag);
+	//uint8_t testDigest[] = {0x2b,0x2b,0x2b,0x2b};
+	uint8_t testDigest[4];
+	uint8_t knownData[] = {0x2b,0x10,0x10,0x2b,0x10,0x10,0x10};
+	Hash(knownData,7,4,testDigest);
+	updateLedState(testDigest);
+	showLeds();
+	Delay_Ms(1000);
+
+	// read badge state from flash
+	// if padByte != 0x11, initialize struct
+	// read start of third sector
+	uint8_t len = sizeof(struct BadgeState_t);
+	uint8_t buf[len];
+	uint32_t addr = 0x00070000;
+	ch5xx_flash_cmd_read(addr, buf, len);
+	memcpy(&BadgeState,buf,len);
+
+	uint8_t cfgReg = *(uint8_t*)(R8_GLOB_ROM_CFG);
+	printf("Config Reg %x\r\n", cfgReg);
+
+	if(BadgeState.padByte != 0x11)
+	{
+		
+		//initalize badge state
+		BadgeState.padByte = 0x11;
+		BadgeState.foundTagHash = 0;
+		BadgeState.markersFound = 0;
+		BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash +BadgeState.markersFound) & 0xFF;
+		Delay_Ms(50);
+		// erase flash
+		int ret = ch5xx_flash_cmd_erase(addr, 0x100);
+		printf("Flash erase status: %d\r\n", ret);
+		Delay_Ms(50);
+		ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
+		int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
+	} else
+	{
+		printf("Restoring badge state\r\n");
+	}
+
+	printf("Badge State:\r\n");
+	printf("  foundTagHash: %x  markersFound: %x\r\n", BadgeState.foundTagHash, BadgeState.markersFound);
+
 
 	// Prove USB is alive even if later bring-up (ADC/NFC) hangs.
 	//usb_tx_queue_message((const uint8_t*)"nfca585 boot", (uint16_t)strlen("nfca585 boot"));
 	//usb_tx_pump();
 	printf("nfc585 boot\r\n");
 	
-	blink(0); // Indicates boot
+	//blink(0,SK6812_BRIGHT,0,0); // Indicates boot
 	
 	#if !SK6812_DISABLE
-	sk6812_set_rgb(0,0, SK6812_BRIGHT, 0);
+	sk6812_set_rgb(0, SK6812_BRIGHT, 0, 0);
+	sk6812_set_rgb(1, 0, SK6812_BRIGHT, 0);
+	sk6812_set_rgb(2, 0, 0, SK6812_BRIGHT);
+	sk6812_set_rgb(3, SK6812_BRIGHT, SK6812_BRIGHT, SK6812_BRIGHT);
+	showLeds();
+	Delay_Ms(33);
 	#endif
 	
 	nfca_init();
