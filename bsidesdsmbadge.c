@@ -249,6 +249,22 @@ struct BadgeState_t {
 
 struct BadgeState_t BadgeState;
 
+void saveBadgeState()
+{
+	uint8_t len = sizeof(struct BadgeState_t);
+	uint8_t buf[len];
+	uint32_t addr = 0x00070000;
+
+	BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash +BadgeState.markersFound) & 0xFF;
+	Delay_Ms(50);
+	// erase flash
+	int ret = ch5xx_flash_cmd_erase(addr, 0x100);
+	printf("Flash erase status: %d\r\n", ret);
+	Delay_Ms(50);
+	ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
+	int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
+}
+
 void checkTagCtf(uint8_t *uuid, uint8_t uuid_len)
 {
 	bool found = true;
@@ -272,6 +288,7 @@ void checkTagCtf(uint8_t *uuid, uint8_t uuid_len)
 			}
 		}
 	}
+	//saveBadgeState();
 }
 
 // end CTF code
@@ -552,6 +569,8 @@ void updateLedState(uint8_t*digest){
 	if(foundFlag)
 	{
 		BadgeState.foundTagHash = true;
+		//saveBadgeState();
+
 	}
 }
 
@@ -2021,17 +2040,25 @@ void main_task_loop() {
 			next_heartbeat_time = SysTick->CNTL + Ticks_from_Ms(333);
 		}
 
-		button_state = funDigitalRead(PA5);
+		button_state = funDigitalRead(PB23);
 		if (!button_state) {
 			printf("Badge State:\r\n");
 			printf("  foundTagHash: %x  markersFound: %x\r\n", BadgeState.foundTagHash, BadgeState.markersFound);
 			if(BadgeState.markersFound == 0xFF)
 			{
 				// make all LEDs Blue
+				for(int i=0; i<4;i++)
+				{
+					sk6812_set_rgb(i, 0, 0, 127);
+				}
 			}
 			if(BadgeState.foundTagHash == true)
 			{
 				// flash all LEDs white
+				for(int i=0; i<4;i++)
+				{
+					blink(i, 127, 127, 127);
+				}
 			}
 		}
 		
@@ -2263,6 +2290,8 @@ int main() {
 	USBFSSetup();
 
 	funPinMode(PA5, GPIO_CFGLR_IN_PU);
+	funPinMode(PB23, GPIO_CFGLR_IN_PU);
+
 
 	for(int i = 0; i < 4; i++)
 	{
@@ -2303,12 +2332,10 @@ int main() {
 	secondFlag[16] = '}';
 
 	//sprintf(message,"%s",secondFlag);
-	//uint8_t testDigest[] = {0x2b,0x2b,0x2b,0x2b};
-	uint8_t testDigest[4];
-	uint8_t knownData[] = {0x2b,0x10,0x10,0x2b,0x10,0x10,0x10};
-	Hash(knownData,7,4,testDigest);
-	updateLedState(testDigest);
-	showLeds();
+	for(int i=0;i<4;i++)
+	{
+		blink(i,128,128,128);
+	}
 	Delay_Ms(1000);
 
 	// read badge state from flash
@@ -2320,8 +2347,8 @@ int main() {
 	ch5xx_flash_cmd_read(addr, buf, len);
 	memcpy(&BadgeState,buf,len);
 
-	uint8_t cfgReg = *(uint8_t*)(R8_GLOB_ROM_CFG);
-	printf("Config Reg %x\r\n", cfgReg);
+	//uint8_t cfgReg = *(uint8_t*)(R8_GLOB_ROM_CFG);
+	//printf("Config Reg %x\r\n", cfgReg);
 
 	if(BadgeState.padByte != 0x11)
 	{
@@ -2331,13 +2358,14 @@ int main() {
 		BadgeState.foundTagHash = 0;
 		BadgeState.markersFound = 0;
 		BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash +BadgeState.markersFound) & 0xFF;
-		Delay_Ms(50);
+		//saveBadgeState();
+		//Delay_Ms(50);
 		// erase flash
-		int ret = ch5xx_flash_cmd_erase(addr, 0x100);
-		printf("Flash erase status: %d\r\n", ret);
-		Delay_Ms(50);
-		ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
-		int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
+		//int ret = ch5xx_flash_cmd_erase(addr, 0x100);
+		//printf("Flash erase status: %d\r\n", ret);
+		//Delay_Ms(50);
+		//ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
+		//int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
 	} else
 	{
 		printf("Restoring badge state\r\n");
