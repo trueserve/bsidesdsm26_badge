@@ -2051,6 +2051,7 @@ void main_task_loop() {
 				{
 					sk6812_set_rgb(i, 0, 0, 127);
 				}
+				showLeds();
 			}
 			if(BadgeState.foundTagHash == true)
 			{
