@@ -41,6 +41,11 @@
 #define SK6812_W_BRIGHT 0
 #endif
 
+#define IDLE_RESUME_DELAY_MS 5000u
+#define IDLE_RAINBOW_DURATION_MS 12000u
+#define IDLE_EFFECT_DURATION_MS 9000u
+#define IDLE_FRAME_INTERVAL_MS 75u
+
 #define AUDIO_OUTPUT_PIN         PB0
 
 #define NOTE_C5 523u
@@ -249,22 +254,6 @@ struct BadgeState_t {
 
 struct BadgeState_t BadgeState;
 
-void saveBadgeState()
-{
-	uint8_t len = sizeof(struct BadgeState_t);
-	uint8_t buf[len];
-	uint32_t addr = 0x00070000;
-
-	BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash +BadgeState.markersFound) & 0xFF;
-	Delay_Ms(50);
-	// erase flash
-	int ret = ch5xx_flash_cmd_erase(addr, 0x100);
-	printf("Flash erase status: %d\r\n", ret);
-	Delay_Ms(50);
-	ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
-	int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
-}
-
 void checkTagCtf(uint8_t *uuid, uint8_t uuid_len)
 {
 	bool found = true;
@@ -288,7 +277,6 @@ void checkTagCtf(uint8_t *uuid, uint8_t uuid_len)
 			}
 		}
 	}
-	//saveBadgeState();
 }
 
 // end CTF code
@@ -433,6 +421,8 @@ struct RGBW {
 } RGBW;
 
 struct RGBW pixels[4];
+static uint32_t g_led_activity_tick;
+static uint32_t g_next_idle_led_time;
 
 void blink(int n, uint8_t r, uint8_t g, uint8_t b);
 void debug_print(const uint8_t* msgBuf);
@@ -515,6 +505,123 @@ static void sk6812_set_rgb(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
 	}
 }
 
+static uint8_t scale_u8(uint8_t value, uint8_t scale)
+{
+	return (uint8_t)(((uint16_t)value * (uint16_t)scale) / 255u);
+}
+
+static uint8_t triangle_u8(uint8_t phase)
+{
+	if (phase & 0x80) {
+		return (uint8_t)((255u - phase) << 1);
+	}
+	return (uint8_t)(phase << 1);
+}
+
+static void hue_to_rgb(uint8_t hue, uint8_t value, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+	uint8_t region = hue / 43u;
+	uint8_t remainder = (uint8_t)((hue - (region * 43u)) * 6u);
+	uint8_t q = scale_u8(value, (uint8_t)(255u - remainder));
+	uint8_t t = scale_u8(value, remainder);
+
+	switch (region) {
+		default:
+		case 0:
+			*r = value; *g = t;     *b = 0;
+			break;
+		case 1:
+			*r = q;     *g = value; *b = 0;
+			break;
+		case 2:
+			*r = 0;     *g = value; *b = t;
+			break;
+		case 3:
+			*r = 0;     *g = q;     *b = value;
+			break;
+		case 4:
+			*r = t;     *g = 0;     *b = value;
+			break;
+		case 5:
+			*r = value; *g = 0;     *b = q;
+			break;
+	}
+}
+
+static void note_led_activity(void)
+{
+	uint32_t now = (uint32_t)now_ticks();
+	g_led_activity_tick = now;
+	g_next_idle_led_time = now + Ticks_from_Ms(IDLE_FRAME_INTERVAL_MS);
+}
+
+static bool render_idle_leds(uint32_t now)
+{
+	static const uint8_t palette_hues[] = { 0u, 21u, 96u, 149u, 181u };
+	uint32_t idle_ready_at = g_led_activity_tick + Ticks_from_Ms(IDLE_RESUME_DELAY_MS);
+	uint32_t idle_ticks;
+	uint32_t idle_ms;
+	uint32_t effect_ms;
+	uint8_t r, g, b;
+
+	if (TimeElapsed32(now, idle_ready_at) < 0) {
+		return false;
+	}
+
+	idle_ticks = TimeElapsed32u(now, idle_ready_at);
+	idle_ms = idle_ticks / Ticks_from_Ms(1);
+
+	if (idle_ms < IDLE_RAINBOW_DURATION_MS) {
+		uint8_t base_hue = (uint8_t)(idle_ms / 6u);
+		uint8_t breath = (uint8_t)(14u + (triangle_u8((uint8_t)(idle_ms / 10u)) >> 4));
+		for (uint8_t i = 0; i < 4; i++) {
+			hue_to_rgb((uint8_t)(base_hue + (i * 32u)), breath, &r, &g, &b);
+			sk6812_set_rgb(i, r, g, b);
+		}
+		return true;
+	}
+
+	effect_ms = idle_ms - IDLE_RAINBOW_DURATION_MS;
+	switch ((effect_ms / IDLE_EFFECT_DURATION_MS) % 3u) {
+		case 0: {
+			uint8_t palette_step = (uint8_t)((effect_ms / 1600u) % (sizeof(palette_hues) / sizeof(palette_hues[0])));
+			for (uint8_t i = 0; i < 4; i++) {
+				uint8_t hue = palette_hues[(palette_step + i) % (sizeof(palette_hues) / sizeof(palette_hues[0]))];
+				uint8_t level = (uint8_t)(8u + (triangle_u8((uint8_t)((effect_ms / 14u) + (i * 40u))) >> 4));
+				hue_to_rgb(hue, level, &r, &g, &b);
+				sk6812_set_rgb(i, r, g, b);
+			}
+			break;
+		}
+		case 1: {
+			uint8_t head = (uint8_t)((effect_ms / 850u) % 4u);
+			uint8_t hue = (uint8_t)(149u + (effect_ms / 24u));
+			for (uint8_t i = 0; i < 4; i++) {
+				uint8_t distance = (uint8_t)((i + 4u - head) % 4u);
+				uint8_t level = (distance == 0u) ? SK6812_BRIGHT : (distance == 1u ? (SK6812_BRIGHT / 2u) : 4u);
+				hue_to_rgb((uint8_t)(hue + (distance * 10u)), level, &r, &g, &b);
+				sk6812_set_rgb(i, r, g, b);
+			}
+			break;
+		}
+		default: {
+			uint8_t hue_a = (uint8_t)(21u + (effect_ms / 28u));
+			uint8_t hue_b = (uint8_t)(hue_a + 96u);
+			uint8_t mix = triangle_u8((uint8_t)(effect_ms / 18u));
+			uint8_t level_a = (uint8_t)(6u + scale_u8((uint8_t)(SK6812_BRIGHT - 6u), mix));
+			uint8_t level_b = (uint8_t)(6u + scale_u8((uint8_t)(SK6812_BRIGHT - 6u), (uint8_t)(255u - mix)));
+			for (uint8_t i = 0; i < 4; i++) {
+				uint8_t hue = (i & 0x1u) ? hue_b : hue_a;
+				uint8_t level = (i & 0x1u) ? level_b : level_a;
+				hue_to_rgb((uint8_t)(hue + (i * 6u)), level, &r, &g, &b);
+				sk6812_set_rgb(i, r, g, b);
+			}
+			break;
+		}
+	}
+	return true;
+}
+
 void showLeds()
 {
 	sk6812_set_grbw();
@@ -569,9 +676,8 @@ void updateLedState(uint8_t*digest){
 	if(foundFlag)
 	{
 		BadgeState.foundTagHash = true;
-		//saveBadgeState();
-
 	}
+	note_led_activity();
 }
 
 static void audio_init(void)
@@ -2007,6 +2113,7 @@ void main_task_loop() {
 	int uuid_len = 0;
 	uint32_t next_scan_time = 0;
 	uint32_t next_heartbeat_time = 0;
+	uint32_t now = 0;
     uint8_t saw_card_response = 0;
 	uint8_t DIGEST_LENGTH = 4;
 	uint8_t digest[DIGEST_LENGTH];
@@ -2035,36 +2142,35 @@ void main_task_loop() {
 		//usb_tx_pump();
 		
 		// 2. Handle Heartbeat (Non-blocking)
-		if (SysTick->CNTL > next_heartbeat_time) {
+		now = SysTick->CNTL;
+		if (TimeElapsed32(now, next_heartbeat_time) >= 0) {
 			send_heartbeat_if_free();
-			next_heartbeat_time = SysTick->CNTL + Ticks_from_Ms(333);
+			next_heartbeat_time = now + Ticks_from_Ms(333);
 		}
 
-		button_state = funDigitalRead(PB23);
+		if (TimeElapsed32(now, g_next_idle_led_time) >= 0) {
+			if (render_idle_leds(now)) {
+				showLeds();
+			}
+			g_next_idle_led_time = now + Ticks_from_Ms(IDLE_FRAME_INTERVAL_MS);
+		}
+
+		button_state = funDigitalRead(PA5);
 		if (!button_state) {
 			printf("Badge State:\r\n");
 			printf("  foundTagHash: %x  markersFound: %x\r\n", BadgeState.foundTagHash, BadgeState.markersFound);
 			if(BadgeState.markersFound == 0xFF)
 			{
 				// make all LEDs Blue
-				for(int i=0; i<4;i++)
-				{
-					sk6812_set_rgb(i, 0, 0, 127);
-				}
-				showLeds();
 			}
 			if(BadgeState.foundTagHash == true)
 			{
 				// flash all LEDs white
-				for(int i=0; i<4;i++)
-				{
-					blink(i, 127, 127, 127);
-				}
 			}
 		}
 		
 		// 3. Handle NFC Scan (Periodically)
-		if (SysTick->CNTL > next_scan_time) {
+		if (TimeElapsed32(now, next_scan_time) >= 0) {
             saw_card_response = 0;
 			
 			nfca_pcd_start();
@@ -2291,8 +2397,6 @@ int main() {
 	USBFSSetup();
 
 	funPinMode(PA5, GPIO_CFGLR_IN_PU);
-	funPinMode(PB23, GPIO_CFGLR_IN_PU);
-
 
 	for(int i = 0; i < 4; i++)
 	{
@@ -2306,6 +2410,9 @@ int main() {
 	sk6812_set_rgb(0,SK6812_BRIGHT, 0, 0);
 	showLeds();
 	#endif
+
+	g_led_activity_tick = (uint32_t)now_ticks() - Ticks_from_Ms(IDLE_RESUME_DELAY_MS);
+	g_next_idle_led_time = (uint32_t)now_ticks();
 
 	
 	
@@ -2333,10 +2440,12 @@ int main() {
 	secondFlag[16] = '}';
 
 	//sprintf(message,"%s",secondFlag);
-	for(int i=0;i<4;i++)
-	{
-		blink(i,128,128,128);
-	}
+	//uint8_t testDigest[] = {0x2b,0x2b,0x2b,0x2b};
+	uint8_t testDigest[4];
+	uint8_t knownData[] = {0x2b,0x10,0x10,0x2b,0x10,0x10,0x10};
+	Hash(knownData,7,4,testDigest);
+	updateLedState(testDigest);
+	showLeds();
 	Delay_Ms(1000);
 
 	// read badge state from flash
@@ -2348,8 +2457,8 @@ int main() {
 	ch5xx_flash_cmd_read(addr, buf, len);
 	memcpy(&BadgeState,buf,len);
 
-	//uint8_t cfgReg = *(uint8_t*)(R8_GLOB_ROM_CFG);
-	//printf("Config Reg %x\r\n", cfgReg);
+	uint8_t cfgReg = *(uint8_t*)(R8_GLOB_ROM_CFG);
+	printf("Config Reg %x\r\n", cfgReg);
 
 	if(BadgeState.padByte != 0x11)
 	{
@@ -2359,14 +2468,7 @@ int main() {
 		BadgeState.foundTagHash = 0;
 		BadgeState.markersFound = 0;
 		BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash +BadgeState.markersFound) & 0xFF;
-		//saveBadgeState();
-		//Delay_Ms(50);
-		// erase flash
-		//int ret = ch5xx_flash_cmd_erase(addr, 0x100);
-		//printf("Flash erase status: %d\r\n", ret);
-		//Delay_Ms(50);
-		//ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
-		//int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
+		Delay_Ms(50);
 	} else
 	{
 		printf("Restoring badge state\r\n");
