@@ -41,6 +41,22 @@
 #define SK6812_W_BRIGHT 0
 #endif
 
+#define IDLE_RESUME_DELAY_MS 5000u
+#define IDLE_RAINBOW_DURATION_MS 12000u
+#define IDLE_EFFECT_DURATION_MS 9000u
+#define IDLE_FRAME_INTERVAL_MS 75u
+
+// --- BUT1 (PB23) gesture + marquee mode ------------------------------------
+#define BTN_DEBOUNCE_MS        15u   // raw level must be stable this long
+#define BTN_TAP_MAX_MS         400u  // press shorter than this counts as a tap
+#define BTN_HOLD_MS            800u  // press-and-hold threshold (toggle marquee)
+#define MARQUEE_DEFAULT_BPM    10u
+#define MARQUEE_MIN_BPM        10u
+#define MARQUEE_MAX_BPM        300u
+#define MARQUEE_TAP_TIMEOUT_MS 8000u // taps farther apart than this restart tempo
+#define MARQUEE_LED_COUNT      4u    // physical SK6812 pixels on the strip
+#define MARQUEE_FRAME_MS       16u   // cap LED hardware writes at ~60 fps (keeps USB responsive)
+
 #define AUDIO_OUTPUT_PIN         PB0
 
 #define NOTE_C5 523u
@@ -433,6 +449,23 @@ struct RGBW {
 } RGBW;
 
 struct RGBW pixels[4];
+static uint32_t g_led_activity_tick;
+static uint32_t g_next_idle_led_time;
+
+// LED display mode: normal (idle/NFC) vs. tap-tempo marquee.
+typedef enum { LED_MODE_NORMAL = 0, LED_MODE_MARQUEE } led_mode_t;
+static led_mode_t g_led_mode = LED_MODE_NORMAL;
+static uint16_t g_marquee_bpm = MARQUEE_DEFAULT_BPM;
+static uint32_t g_marquee_phase_q8;     // sweep phase, Q8 (256 = one beat/sweep)
+static uint16_t g_marquee_phase_frac;   // sub-phase accumulator Q8 for slow BPMs
+static uint32_t g_marquee_last_render;  // tick of last frame
+static uint16_t g_marquee_fade;         // fade-up envelope, 0..256
+static uint8_t  g_marquee_hue;          // slowly drifting base hue (integer)
+static uint16_t g_marquee_hue_frac;     // sub-hue accumulator Q8 for smooth cycling
+static uint32_t g_marquee_last_tap_tick;
+static uint8_t  g_marquee_have_last_tap;
+static uint8_t  g_marquee_real_taps;    // real user taps since entering marquee
+static uint32_t g_marquee_last_write;   // tick of last sk6812 hardware write
 
 void blink(int n, uint8_t r, uint8_t g, uint8_t b);
 void debug_print(const uint8_t* msgBuf);
@@ -515,6 +548,288 @@ static void sk6812_set_rgb(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
 	}
 }
 
+
+static uint8_t scale_u8(uint8_t value, uint8_t scale)
+{
+	return (uint8_t)(((uint16_t)value * (uint16_t)scale) / 255u);
+}
+
+static uint8_t triangle_u8(uint8_t phase)
+{
+	if (phase & 0x80) {
+		return (uint8_t)((255u - phase) << 1);
+	}
+	return (uint8_t)(phase << 1);
+}
+
+static void hue_to_rgb(uint8_t hue, uint8_t value, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+	uint8_t region = hue / 43u;
+	uint8_t remainder = (uint8_t)((hue - (region * 43u)) * 6u);
+	uint8_t q = scale_u8(value, (uint8_t)(255u - remainder));
+	uint8_t t = scale_u8(value, remainder);
+
+	switch (region) {
+		default:
+		case 0:
+			*r = value; *g = t;     *b = 0;
+			break;
+		case 1:
+			*r = q;     *g = value; *b = 0;
+			break;
+		case 2:
+			*r = 0;     *g = value; *b = t;
+			break;
+		case 3:
+			*r = 0;     *g = q;     *b = value;
+			break;
+		case 4:
+			*r = t;     *g = 0;     *b = value;
+			break;
+		case 5:
+			*r = value; *g = 0;     *b = q;
+			break;
+	}
+}
+
+static void note_led_activity(void)
+{
+	uint32_t now = (uint32_t)now_ticks();
+	g_led_activity_tick = now;
+	g_next_idle_led_time = now + Ticks_from_Ms(IDLE_FRAME_INTERVAL_MS);
+}
+
+static bool render_idle_leds(uint32_t now)
+{
+	static const uint8_t palette_hues[] = { 0u, 21u, 96u, 149u, 181u };
+	uint32_t idle_ready_at = g_led_activity_tick + Ticks_from_Ms(IDLE_RESUME_DELAY_MS);
+	uint32_t idle_ticks;
+	uint32_t idle_ms;
+	uint32_t effect_ms;
+	uint8_t r, g, b;
+
+	if (TimeElapsed32(now, idle_ready_at) < 0) {
+		return false;
+	}
+
+	idle_ticks = TimeElapsed32u(now, idle_ready_at);
+	idle_ms = idle_ticks / Ticks_from_Ms(1);
+
+	if (idle_ms < IDLE_RAINBOW_DURATION_MS) {
+		uint8_t base_hue = (uint8_t)(idle_ms / 6u);
+		uint8_t breath = (uint8_t)(14u + (triangle_u8((uint8_t)(idle_ms / 10u)) >> 4));
+		for (uint8_t i = 0; i < 4; i++) {
+			hue_to_rgb((uint8_t)(base_hue + (i * 32u)), breath, &r, &g, &b);
+			sk6812_set_rgb(i, r, g, b);
+		}
+		return true;
+	}
+
+	effect_ms = idle_ms - IDLE_RAINBOW_DURATION_MS;
+	switch ((effect_ms / IDLE_EFFECT_DURATION_MS) % 3u) {
+		case 0: {
+			uint8_t palette_step = (uint8_t)((effect_ms / 1600u) % (sizeof(palette_hues) / sizeof(palette_hues[0])));
+			for (uint8_t i = 0; i < 4; i++) {
+				uint8_t hue = palette_hues[(palette_step + i) % (sizeof(palette_hues) / sizeof(palette_hues[0]))];
+				uint8_t level = (uint8_t)(8u + (triangle_u8((uint8_t)((effect_ms / 14u) + (i * 40u))) >> 4));
+				hue_to_rgb(hue, level, &r, &g, &b);
+				sk6812_set_rgb(i, r, g, b);
+			}
+			break;
+		}
+		case 1: {
+			uint8_t head = (uint8_t)((effect_ms / 850u) % 4u);
+			uint8_t hue = (uint8_t)(149u + (effect_ms / 24u));
+			for (uint8_t i = 0; i < 4; i++) {
+				uint8_t distance = (uint8_t)((i + 4u - head) % 4u);
+				uint8_t level = (distance == 0u) ? SK6812_BRIGHT : (distance == 1u ? (SK6812_BRIGHT / 2u) : 4u);
+				hue_to_rgb((uint8_t)(hue + (distance * 10u)), level, &r, &g, &b);
+				sk6812_set_rgb(i, r, g, b);
+			}
+			break;
+		}
+		default: {
+			uint8_t hue_a = (uint8_t)(21u + (effect_ms / 28u));
+			uint8_t hue_b = (uint8_t)(hue_a + 96u);
+			uint8_t mix = triangle_u8((uint8_t)(effect_ms / 18u));
+			uint8_t level_a = (uint8_t)(6u + scale_u8((uint8_t)(SK6812_BRIGHT - 6u), mix));
+			uint8_t level_b = (uint8_t)(6u + scale_u8((uint8_t)(SK6812_BRIGHT - 6u), (uint8_t)(255u - mix)));
+			for (uint8_t i = 0; i < 4; i++) {
+				uint8_t hue = (i & 0x1u) ? hue_b : hue_a;
+				uint8_t level = (i & 0x1u) ? level_b : level_a;
+				hue_to_rgb((uint8_t)(hue + (i * 6u)), level, &r, &g, &b);
+				sk6812_set_rgb(i, r, g, b);
+			}
+			break;
+		}
+	}
+	return true;
+}
+
+// Convert the current BPM into a per-beat interval in SysTick ticks. One marquee
+// sweep (end-to-end) takes exactly one beat, so the comet reverses direction on
+// the beat.
+static uint32_t marquee_beat_ticks(void)
+{
+	uint16_t bpm = g_marquee_bpm;
+	if (bpm < MARQUEE_MIN_BPM) bpm = MARQUEE_MIN_BPM;
+	if (bpm > MARQUEE_MAX_BPM) bpm = MARQUEE_MAX_BPM;
+	return Ticks_from_Ms(60000u / bpm);
+}
+
+static void marquee_enter(void)
+{
+	uint32_t now = (uint32_t)now_ticks();
+	uint32_t beat = Ticks_from_Ms(60000u / MARQUEE_DEFAULT_BPM);
+	g_led_mode = LED_MODE_MARQUEE;
+	g_marquee_bpm = MARQUEE_DEFAULT_BPM;
+	// Start mid-sweep so startup does not sit on an endpoint while fading in.
+	g_marquee_phase_q8 = 64;
+	g_marquee_phase_frac = 0;
+	g_marquee_fade = 0;          // start dark and fade up
+	g_marquee_hue = 0;
+	g_marquee_hue_frac = 0;
+	// Seed two fake taps one beat apart so the rhythm is established from the
+	// very first frame rather than starting with an undefined interval.
+	g_marquee_last_tap_tick = now - beat;
+	g_marquee_have_last_tap = 1;
+	g_marquee_real_taps = 0;
+	g_marquee_last_render = now;
+	g_marquee_last_write = now - Ticks_from_Ms(MARQUEE_FRAME_MS); // force first frame
+}
+
+static void marquee_exit(void)
+{
+	g_led_mode = LED_MODE_NORMAL;
+	for (uint8_t i = 0; i < MARQUEE_LED_COUNT; i++) {
+		sk6812_set_rgb(i, 0, 0, 0);
+	}
+	sk6812_set_grbw();
+	note_led_activity(); // hand the LEDs back to the idle animation cleanly
+}
+
+// Register a tap-tempo beat: derive BPM from the gap to the previous tap, and
+// re-sync the sweep so the next direction change lands on this tap.
+static void marquee_tap(uint32_t now)
+{
+	if (g_marquee_have_last_tap && g_marquee_real_taps > 0u) {
+		uint32_t interval_ms = TimeElapsed32u(now, g_marquee_last_tap_tick) / Ticks_from_Ms(1);
+		if (interval_ms > 0u && interval_ms <= MARQUEE_TAP_TIMEOUT_MS) {
+			uint32_t bpm = 60000u / interval_ms;
+			if (bpm < MARQUEE_MIN_BPM) bpm = MARQUEE_MIN_BPM;
+			if (bpm > MARQUEE_MAX_BPM) bpm = MARQUEE_MAX_BPM;
+			g_marquee_bpm = (uint16_t)bpm;
+		}
+	}
+	// Snap to a beat boundary so the bounce visibly locks to the taps.
+	g_marquee_phase_q8 = 0;
+	g_marquee_phase_frac = 0;
+	g_marquee_last_render = now;
+	g_marquee_last_tap_tick = now;
+	g_marquee_have_last_tap = 1;
+	g_marquee_real_taps = 1;
+}
+
+// Smoothly animated bouncing comet with a fading trail. One end-to-end sweep
+// per beat, so the head reverses direction exactly on the beat — that motion
+// is the tempo indicator (no strobe, so it stays smooth). Each LED's brightness
+// falls off with its distance from the head for a soft glowing tail.
+static void marquee_render(uint32_t now)
+{
+	const int32_t span_q8 = (int32_t)(MARQUEE_LED_COUNT - 1u) * 256; // 0..(N-1)
+	const int32_t spread_q8 = 700;          // ~2.7 LED comet half-width (wider band)
+	uint32_t dt;
+	uint32_t beat;
+	int32_t headf;
+	uint8_t base_hue;
+
+	// Advance phase: 256 (Q8 one) == one beat. Keep fractional carry so
+	// slow tempos do not lose sub-pixel movement to integer truncation.
+	dt = TimeElapsed32u(now, g_marquee_last_render);
+	g_marquee_last_render = now;
+	beat = marquee_beat_ticks();
+	if (beat == 0u) beat = 1u;
+	{
+		uint32_t add = (uint32_t)(((uint64_t)dt * 65536u) / beat); // Q8 phase + Q8 fraction
+		uint32_t total = (uint32_t)g_marquee_phase_frac + add;
+		g_marquee_phase_q8 += (total >> 8);
+		g_marquee_phase_frac = (uint16_t)(total & 0xFFu);
+	}
+
+	// Ease the whole effect up from black when first entering (~prettier start).
+	if (g_marquee_fade < 256u) {
+		uint16_t add = (uint16_t)((dt * 256u) / Ticks_from_Ms(600u) + 1u);
+		g_marquee_fade = (uint16_t)((g_marquee_fade + add > 256u) ? 256u : g_marquee_fade + add);
+	}
+
+	// Rainbow cycling: smoothly drift the base hue through the full spectrum
+	// (~one full cycle every ~3 s). Use a fractional accumulator so every
+	// frame advances by exactly the right sub-integer amount with no jump.
+	{
+		uint32_t add = (dt * 256u) / Ticks_from_Ms(3000u);   // Q8 step this frame
+		g_marquee_hue_frac += (uint16_t)add;
+		if (g_marquee_hue_frac >= 256u) {
+			g_marquee_hue += (uint8_t)(g_marquee_hue_frac >> 8);
+			g_marquee_hue_frac &= 0xFFu;
+		}
+	}
+
+	// One beat = one full round-trip (0→span in the first half, span→0 in
+	// the second). Lower byte of phase is a triangle wave: 0..127 = forward,
+	// 128..255 = backward. Dividing by 127 (not 128) ensures the head reaches
+	// exactly span_q8 at the midpoint, so there is no snap/tick at the
+	// direction reversal.
+	{
+		uint8_t  phase_byte = (uint8_t)(g_marquee_phase_q8 & 0xFFu);
+		uint32_t t = (phase_byte <= 127u) ? (uint32_t)phase_byte
+		                                  : (uint32_t)(255u - phase_byte);
+		headf = (t == 0u)    ? 0
+		      : (t >= 127u)  ? span_q8
+		      : (int32_t)((uint32_t)span_q8 * t / 127u);
+	}
+
+	// Tempo tint: slow = blue (hue ~170), fast = red (hue ~0), plus slow drift.
+	{
+		uint16_t bpm = g_marquee_bpm;
+		if (bpm < MARQUEE_MIN_BPM) bpm = MARQUEE_MIN_BPM;
+		if (bpm > MARQUEE_MAX_BPM) bpm = MARQUEE_MAX_BPM;
+		base_hue = (uint8_t)(170u - (((uint32_t)(bpm - MARQUEE_MIN_BPM) * 170u) /
+		                             (MARQUEE_MAX_BPM - MARQUEE_MIN_BPM)));
+	}
+	base_hue = (uint8_t)(base_hue + g_marquee_hue);
+
+	for (uint8_t i = 0; i < MARQUEE_LED_COUNT; i++) {
+		int32_t d = (int32_t)i * 256 - headf;
+		uint8_t r = 0, g = 0, b = 0;
+		uint32_t lvl = 0;
+		if (d < 0) d = -d;
+		if (d < spread_q8) {
+			// Triangular falloff -> soft comet tail.
+			lvl = (uint32_t)SK6812_BRIGHT * (uint32_t)(spread_q8 - d) / (uint32_t)spread_q8;
+		}
+		// Glitter floor: every pixel keeps a faint sparkle so the whole strip
+		// shimmers, with the moving band riding brighter on top.
+		{
+			uint32_t floor = (uint32_t)SK6812_BRIGHT / 6u;
+			if (lvl < floor) lvl = floor;
+		}
+		lvl = lvl * g_marquee_fade / 256u;          // apply fade-up envelope
+		if (lvl > 0u) {
+			// Spread a rainbow across the strip — 64 hue/LED gives distinct
+			// colors on each of the 4 pixels (red→yellow→cyan→blue range).
+			hue_to_rgb((uint8_t)(base_hue + (uint8_t)(i * 64u)), (uint8_t)lvl, &r, &g, &b);
+		}
+		sk6812_set_rgb(i, r, g, b);
+	}
+	// Rate-limit hardware writes to ~60 fps so the main loop runs fast enough
+	// to service USB interrupts between writes. Phase/pixel values are still
+	// updated every iteration for accurate timing.
+	if (TimeElapsed32u(now, g_marquee_last_write) >= Ticks_from_Ms(MARQUEE_FRAME_MS)) {
+		g_marquee_last_write = now;
+		sk6812_set_grbw();
+	}
+}
+
 void showLeds()
 {
 	sk6812_set_grbw();
@@ -569,9 +884,11 @@ void updateLedState(uint8_t*digest){
 	if(foundFlag)
 	{
 		BadgeState.foundTagHash = true;
+        //When you finally figure out what is wrong with the forking flash we can remove this
 		//saveBadgeState();
 
 	}
+    note_led_activity();
 }
 
 static void audio_init(void)
@@ -1048,7 +1365,7 @@ void GPIOSetup() {
 	funPinMode( STATUS_SK6812_PIN, GPIO_ModeOut_PP_20mA );
 	GPIO_ResetBits( STATUS_SK6812_PIN );
 	audio_init();
-	sk6812_set_grbw(0, 0, 0, 0);
+	sk6812_set_grbw();
 	
 	#if ENABLE_BOOT_BUTTON
 	funPinMode( PB22, GPIO_CFGLR_IN_PU ); // Set PB22 to input, pullup as keypress is to gnd
@@ -1906,6 +2223,31 @@ int PcdReq(int cmd, uint8_t *data, int len) {
 //void debug_print(const uint8_t* msgBuf);
 // main process loop functions
 
+// Software trigger to enter the WCH USB bootloader without the physical BOOT pin.
+// Send the ASCII token "BOOTSEL" over the USB-CDC serial port (/dev/tty.usbmodem*)
+// and the badge will reset into ISP mode so it can be re-flashed.
+// Delivered by fsusb's poll_input(), which must be called from the main loop.
+__HIGH_CODE
+void handle_usbfs_input(int numbytes, uint8_t *data) {
+	static const char token[] = "BOOTSEL";
+	static uint8_t match = 0;
+	for (int i = 0; i < numbytes; i++) {
+		if (data[i] == (uint8_t)token[match]) {
+			match++;
+			if (token[match] == 0) {
+				// Full token matched -> enter bootloader.
+				printf("Entering bootloader...\r\n");
+				blink(3, 0, 0, 127);
+				USBFSReset(); // required when FUNCONF_USE_USBPRINTF is set
+				jump_isprom(); // does not return
+			}
+		} else {
+			// Restart the match; this byte may itself begin a new token.
+			match = (data[i] == (uint8_t)token[0]) ? 1 : 0;
+		}
+	}
+}
+
 __HIGH_CODE
 void process_usb_packet(void) {
 	// Check if we have received a packet in the global buffer
@@ -2032,7 +2374,30 @@ void main_task_loop() {
 	while(1) {
 		// 1. Always process USB input (e.g. Reboot commands) immediately
 		process_usb_packet();
+		poll_input(); // deliver USB-CDC RX to handle_usbfs_input() (bootloader trigger)
 		//usb_tx_pump();
+		
+		// 1b. LED display update. In marquee mode we paint the bouncing
+		// tap-tempo runner; otherwise the idle ambient animation takes over
+		// once it's been IDLE_RESUME_DELAY_MS since the last activity.
+		uint8_t led_frame_tick = 0; // set when NFC scan is permitted this iteration
+		{
+			uint32_t led_now = (uint32_t)now_ticks();
+			if (g_led_mode == LED_MODE_MARQUEE) {
+				// Run flat-out: render every loop so the beat strobe is crisp.
+				// Permit NFC scans only right after a hardware write so the
+				// blocking scan lands at the start of a frame, not mid-frame.
+				uint32_t prev_write = g_marquee_last_write;
+				marquee_render(led_now);
+				led_frame_tick = (g_marquee_last_write != prev_write) ? 1u : 0u;
+			} else if (TimeElapsed32(led_now, g_next_idle_led_time) >= 0) {
+				g_next_idle_led_time = led_now + Ticks_from_Ms(IDLE_FRAME_INTERVAL_MS);
+				if (render_idle_leds(led_now)) {
+					sk6812_set_grbw();
+					led_frame_tick = 1;
+				}
+			}
+		}
 		
 		// 2. Handle Heartbeat (Non-blocking)
 		if (SysTick->CNTL > next_heartbeat_time) {
@@ -2040,31 +2405,89 @@ void main_task_loop() {
 			next_heartbeat_time = SysTick->CNTL + Ticks_from_Ms(333);
 		}
 
+		// --- BUT1 read --------------------------------------------------
+		// SW (PB23) is the single control button: input pull-up, idle high,
+		// press pulls to gnd.
 		button_state = funDigitalRead(PB23);
-		if (!button_state) {
-			printf("Badge State:\r\n");
-			printf("  foundTagHash: %x  markersFound: %x\r\n", BadgeState.foundTagHash, BadgeState.markersFound);
-			if(BadgeState.markersFound == 0xFF)
-			{
-				// make all LEDs Blue
-				for(int i=0; i<4;i++)
-				{
-					sk6812_set_rgb(i, 0, 0, 127);
-				}
-				showLeds();
+		// --- BUT1 (PB23) gesture detector -------------------------------
+		// TAP   -> report badge state (CTF / validation station)  [normal mode]
+		//        -> set tap-tempo BPM                              [marquee mode]
+		// HOLD  -> toggle the tap-tempo marquee on/off
+		{
+			static uint8_t  btn_level = 1;       // debounced level (1=up, active low)
+			static uint8_t  btn_raw_last = 1;
+			static uint32_t btn_raw_change = 0;
+			static uint32_t btn_press_start = 0;
+			static uint8_t  btn_hold_fired = 0;  // marquee toggle fired this press
+
+			uint32_t now = (uint32_t)now_ticks();
+			uint8_t raw = button_state ? 1u : 0u;
+			uint8_t tap_event = 0;
+
+			if (raw != btn_raw_last) {
+				btn_raw_last = raw;
+				btn_raw_change = now;
 			}
-			if(BadgeState.foundTagHash == true)
-			{
-				// flash all LEDs white
-				for(int i=0; i<4;i++)
+			if (raw != btn_level &&
+			    TimeElapsed32u(now, btn_raw_change) >= Ticks_from_Ms(BTN_DEBOUNCE_MS)) {
+				btn_level = raw;
+				if (btn_level == 0u) {            // pressed (falling edge)
+					btn_press_start = now;
+					btn_hold_fired = 0;
+				} else if (!btn_hold_fired &&    // released (rising edge)
+				           TimeElapsed32u(now, btn_press_start) <= Ticks_from_Ms(BTN_TAP_MAX_MS)) {
+					tap_event = 1;
+				}
+			}
+			// Hold past the threshold -> toggle marquee (fires once per press).
+			if (btn_level == 0u && !btn_hold_fired &&
+			    TimeElapsed32u(now, btn_press_start) >= Ticks_from_Ms(BTN_HOLD_MS)) {
+				btn_hold_fired = 1;
+				if (g_led_mode == LED_MODE_MARQUEE) {
+					marquee_exit();
+					printf("Marquee: off\r\n");
+				} else {
+					marquee_enter();
+					printf("Marquee: on\r\n");
+				}
+			}
+
+			button_state = btn_level; // downstream logic uses debounced level
+
+			if (g_led_mode == LED_MODE_MARQUEE) {
+				// Tap-tempo beat sets the BPM.
+				if (tap_event) {
+					marquee_tap(now);
+					printf("Marquee: %u BPM\r\n", (unsigned)g_marquee_bpm);
+				}
+			} else if (tap_event) {
+				// CTF / validation: a tap reports the badge state.
+				printf("Badge State:\r\n");
+				printf("  foundTagHash: %x  markersFound: %x\r\n", BadgeState.foundTagHash, BadgeState.markersFound);
+				if(BadgeState.markersFound == 0xFF)
 				{
-					blink(i, 127, 127, 127);
+					// make all LEDs Blue
+					for(int i=0; i<4;i++)
+					{
+						sk6812_set_rgb(i, 0, 0, 127);
+					}
+					showLeds();
+				}
+				if(BadgeState.foundTagHash == true)
+				{
+					// flash all LEDs white
+					for(int i=0; i<4;i++)
+					{
+						blink(i, 127, 127, 127);
+					}
 				}
 			}
 		}
 		
-		// 3. Handle NFC Scan (Periodically)
-		if (SysTick->CNTL > next_scan_time) {
+		// 3. Handle NFC Scan (Periodically). In marquee mode only scan right
+		// after an LED frame write so the blocking scan can't land mid-frame.
+		if ((g_led_mode != LED_MODE_MARQUEE || led_frame_tick) &&
+		    SysTick->CNTL > next_scan_time) {
             saw_card_response = 0;
 			
 			nfca_pcd_start();
@@ -2268,9 +2691,14 @@ void main_task_loop() {
 				// Turn off NFC to save power/reset state
 				nfca_pcd_stop();
 				
+				// The scan blocked the loop for several ms with no LED renders.
+				// Reset the marquee render clock so the next frame computes a
+				// small dt instead of teleporting the comet forward by the scan
+				// duration (that jump is the visible flicker).
+				g_marquee_last_render = (uint32_t)now_ticks();
 				
 				// Schedule next scan for 333ms from NOW
-				next_scan_time = SysTick->CNTL + Ticks_from_Ms(333);
+				next_scan_time = SysTick->CNTL + Ticks_from_Ms(333u);
 
 		}
 	}
@@ -2306,6 +2734,9 @@ int main() {
 	sk6812_set_rgb(0,SK6812_BRIGHT, 0, 0);
 	showLeds();
 	#endif
+
+    g_led_activity_tick = (uint32_t)now_ticks() - Ticks_from_Ms(IDLE_RESUME_DELAY_MS);
+	g_next_idle_led_time = (uint32_t)now_ticks();
 
 	
 	
