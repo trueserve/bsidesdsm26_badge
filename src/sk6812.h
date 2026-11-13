@@ -2,6 +2,9 @@
 #define __SK6812_H
 
 
+#include <stdint.h>
+
+
 
 #if SK6812_PROFILE == 1
 #ifndef SK6812_T0H_NOPS

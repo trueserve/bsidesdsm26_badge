@@ -1,13 +1,24 @@
-#include "ch32fun.h"
 #include <stdio.h>
-#include "fsusb.h"
+#include <stdint.h>
 #include <string.h>
+
+#include "ch32fun.h"
+#include "fsusb.h"
+
 #include "ch5xx_flash.h"
 
 #include "../lib/libISP585/ISP585.h"
 
 #include "hwconf.h"
 #include "sk6812.h"
+
+
+
+#define DATAFLASH_SIZE          0x8000u
+#define DATAFLASH_PAGE_SIZE     256u
+#define DATAFLASH_BLOCK_SIZE    4096u
+
+#define PAD_MAGIC				0x11
 
 
 
@@ -123,25 +134,22 @@ struct BadgeState_t {
 	uint8_t foundTagHash;
 	uint8_t padByte;
 	uint8_t checkSum;
-
 };
 
 struct BadgeState_t BadgeState;
 
 void saveBadgeState()
 {
-	uint8_t len = sizeof(struct BadgeState_t);
-	uint8_t buf[len];
-	uint32_t addr = 0x00070000;
-
-	BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash +BadgeState.markersFound) & 0xFF;
-	Delay_Ms(50);
+	// with data so short, this is easy to fuck up...
+	BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash + BadgeState.markersFound) & 0xFF;
+	
 	// erase flash
-	int ret = ch5xx_flash_cmd_erase(addr, 0x100);
+	int ret = EEPROM_ERASE(0, DATAFLASH_PAGE_SIZE);
 	printf("Flash erase status: %d\r\n", ret);
-	Delay_Ms(50);
-	ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
-	int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
+
+	// program without wear leveling
+	ret = EEPROM_WRITE(0, (uint8_t *)&BadgeState, sizeof(BadgeState));
+	printf("Flash write status: %d\r\n", ret);
 }
 
 void checkTagCtf(uint8_t *uuid, uint8_t uuid_len)
@@ -167,7 +175,7 @@ void checkTagCtf(uint8_t *uuid, uint8_t uuid_len)
 			}
 		}
 	}
-	//saveBadgeState();
+	saveBadgeState();
 }
 
 // end CTF code
@@ -640,28 +648,30 @@ void updateLedState(uint8_t*digest){
             blue = 0;
         }
 
-		if(led_state[i].field.flashing & 0x1 == 0x1) {
+		if((led_state[i].field.flashing & 0x1) == 0x1) {
 			//printf("flashing %x\r\n", i);
 			blink(i,red,green,blue);
 		}
 		sk6812_set_rgb(i,red,green,blue);
 
-		if(!(((led_state[i].field.red & 0x3) == 0x1) &&
-			(led_state[i].field.green == 0x1) &&
-			((led_state[i].field.blue & 0x3) == 0x1) &&
-			(led_state[i].field.flashing & 0x1 == 0x1)))
+		if(!(((led_state[i].field.red      & 0x3) == 0x1) &&
+			 ( led_state[i].field.green           == 0x1) &&
+			 ((led_state[i].field.blue     & 0x3) == 0x1) &&
+			 ((led_state[i].field.flashing & 0x1) == 0x1)))
 			{
 				foundFlag = false;
 			}
 		
     }
+
 	if(foundFlag)
 	{
 		BadgeState.foundTagHash = true;
         //When you finally figure out what is wrong with the forking flash we can remove this
-		//saveBadgeState();
+		saveBadgeState();
 
 	}
+
     note_led_activity();
 }
 
@@ -722,6 +732,7 @@ static void audio_play_tag_cue(const uint8_t *uid, uint8_t uid_len)
 	}
 }
 
+/*
 static void audio_play_detect_chirp(void)
 {
 	audio_init();
@@ -729,6 +740,7 @@ static void audio_play_detect_chirp(void)
 	play_tone(0u, 20u);
 	play_tone(1319u, 36u);
 }
+*/
 
 static void audio_play_boot_debug_beep(void)
 {
@@ -741,6 +753,7 @@ static void audio_play_boot_debug_beep(void)
 	}
 }
 
+/*
 static void tag_feedback(uint8_t uid_len, uint16_t atqa, uint8_t sak)
 {
 	uint8_t r = (uid_len ? ((gs_picc_uid[0] * 5u) & 0x1Fu) : 8u) + 4u;
@@ -757,6 +770,7 @@ static void tag_feedback(uint8_t uid_len, uint16_t atqa, uint8_t sak)
 	//sk6812_set_rgb(0,0, 0, 0);
 	//showLeds();
 }
+*/
 
 static inline void nfca_rx_finalize_from_hw(void) {
 	g_nfca_pcd_recv_bits = R16_NFC_RXTX_LEN;
@@ -818,6 +832,7 @@ static inline int usb_tx_queue_message(const uint8_t *payload, uint16_t payload_
 
 static void usb_send_ntag_version_packet(int uid_len)
 {
+	/*
 	uint8_t packet[1 + 1 + 1 + 10 + NTAG21X_VERSION_LEN];
 	
 	packet[0] = USB_PKT_NTAG_VERSION;
@@ -831,6 +846,7 @@ static void usb_send_ntag_version_packet(int uid_len)
 	for (int i = 0; i < NTAG21X_VERSION_LEN; ++i) {
 		packet[12 + i] = g_last_ntag_version[i];
 	}
+	*/
 	
 	//while (g_usb_tx_len) { }
 	//usb_tx_queue_message(packet, sizeof(packet));
@@ -853,7 +869,7 @@ static void usb_send_ntag_page_packet(uint8_t start_page, const uint8_t *page_da
 
 static void usb_send_ntag_done_packet(uint8_t status_code)
 {
-	uint8_t packet[2] = { USB_PKT_NTAG_DONE, status_code };
+	//uint8_t packet[2] = { USB_PKT_NTAG_DONE, status_code };
 	
 	//while (g_usb_tx_len) { }
 	//usb_tx_queue_message(packet, sizeof(packet));
@@ -2049,7 +2065,7 @@ void debug_print(const uint8_t* msgBuf) {
 
 __HIGH_CODE
 void send_heartbeat_if_free(void) {
-	const char *version = "nfca585 v1";
+	//const char *version = "nfca585 v1";
 	// Only send if no message is currently queued.
 	//if (!g_usb_tx_len) {
 	//	usb_tx_queue_message((const uint8_t*)version, (uint16_t)strlen(version));
@@ -2123,7 +2139,7 @@ void main_task_loop() {
 	int uuid_len = 0;
 	uint32_t next_scan_time = 0;
 	uint32_t next_heartbeat_time = 0;
-    uint8_t saw_card_response = 0;
+    //uint8_t saw_card_response = 0;
 	uint8_t DIGEST_LENGTH = 4;
 	uint8_t digest[DIGEST_LENGTH];
 	uint32_t button_state = 0xff;
@@ -2262,7 +2278,7 @@ void main_task_loop() {
 		// after an LED frame write so the blocking scan can't land mid-frame.
 		if ((g_led_mode != LED_MODE_MARQUEE || led_frame_tick) &&
 		    SysTick->CNTL > next_scan_time) {
-            saw_card_response = 0;
+            //saw_card_response = 0;
 			
 			nfca_pcd_start();
 			
@@ -2294,7 +2310,7 @@ void main_task_loop() {
 				
 				if(reqa_res == PCD_NO_ERROR) {
 					//debug_print("saw card");
-					saw_card_response = 1;
+					//saw_card_response = 1;
 						atqa = ((uint16_t *)(g_nfca_pcd_recv_buf))[0];
 						// Go straight to anticollision; sending HLTA here is unnecessary and can reduce reliability.
 						Delay_Us(350);
@@ -2432,14 +2448,14 @@ void main_task_loop() {
 							printf("Card info: ");
 							for(int i=0;i<uuid_len;i++)
 							{
-								printf("%02x",gs_picc_uid[i]);
+								printf("%02d", gs_picc_uid[i]);
 							}
-							printf(" ATQA: %lx SAK: %lx\r\n",atqa,sak);
+							printf(" ATQA: %d SAK: %d\r\n", atqa, sak);
 							Hash(gs_picc_uid,uuid_len,DIGEST_LENGTH,digest);
 							printf("digest: ");
 							for(int i = 0; i < DIGEST_LENGTH; i++)
 							{
-								printf(" %02x",digest[i]);
+								printf(" %02x", digest[i]);
 							}
 							printf("\r\n");
 							updateLedState(digest);
@@ -2516,8 +2532,9 @@ int main() {
 	
 	uint8_t message[30];
 
-	sprintf(message,"%s",firstFlag);
+	sprintf((char *)message,"%s",firstFlag);
 
+	/*
 	uint8_t secondFlag[20];
 	secondFlag[0] = 'b';
 	secondFlag[1] = 's';
@@ -2536,6 +2553,7 @@ int main() {
 	secondFlag[14] = 't';
 	secondFlag[15] = 'w';
 	secondFlag[16] = '}';
+	*/
 
 	//sprintf(message,"%s",secondFlag);
 	for(int i=0;i<4;i++)
@@ -2547,35 +2565,18 @@ int main() {
 	// read badge state from flash
 	// if padByte != 0x11, initialize struct
 	// read start of third sector
-	uint8_t len = sizeof(struct BadgeState_t);
-	uint8_t buf[len];
-	uint32_t addr = 0x00070000;
-	ch5xx_flash_cmd_read(addr, buf, len);
-	memcpy(&BadgeState,buf,len);
+	EEPROM_READ(0, &BadgeState, sizeof(BadgeState));
+
+	if (BadgeState.padByte != PAD_MAGIC) {
+		memset(&BadgeState, 0, sizeof(BadgeState));
+		BadgeState.padByte = PAD_MAGIC;
+	} else {
+		printf("Restoring badge state\r\n");
+	}
 
 	//uint8_t cfgReg = *(uint8_t*)(R8_GLOB_ROM_CFG);
 	//printf("Config Reg %x\r\n", cfgReg);
 
-	if(BadgeState.padByte != 0x11)
-	{
-		
-		//initalize badge state
-		BadgeState.padByte = 0x11;
-		BadgeState.foundTagHash = 0;
-		BadgeState.markersFound = 0;
-		BadgeState.checkSum = (BadgeState.padByte + BadgeState.foundTagHash +BadgeState.markersFound) & 0xFF;
-		//saveBadgeState();
-		//Delay_Ms(50);
-		// erase flash
-		//int ret = ch5xx_flash_cmd_erase(addr, 0x100);
-		//printf("Flash erase status: %d\r\n", ret);
-		//Delay_Ms(50);
-		//ch5xx_flash_cmd_write(addr, (uint8_t*)&BadgeState, len);
-		//int verify = ch5xx_flash_cmd_verify(addr, buf, sizeof(buf));
-	} else
-	{
-		printf("Restoring badge state\r\n");
-	}
 
 	printf("Badge State:\r\n");
 	printf("  foundTagHash: %x  markersFound: %x\r\n", BadgeState.foundTagHash, BadgeState.markersFound);
@@ -2588,14 +2589,14 @@ int main() {
 	
 	//blink(0,SK6812_BRIGHT,0,0); // Indicates boot
 	
-	#if !SK6812_DISABLE
+#if !SK6812_DISABLE
 	sk6812_set_rgb(0, SK6812_BRIGHT, 0, 0);
 	sk6812_set_rgb(1, 0, SK6812_BRIGHT, 0);
 	sk6812_set_rgb(2, 0, 0, SK6812_BRIGHT);
 	sk6812_set_rgb(3, SK6812_BRIGHT, SK6812_BRIGHT, SK6812_BRIGHT);
 	showLeds();
 	Delay_Ms(33);
-	#endif
+#endif
 	
 	nfca_init();
 	nfca_pcd_lpcd_calibration();
